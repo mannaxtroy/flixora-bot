@@ -12,15 +12,14 @@ import logging
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from telethon import TelegramClient, events
-from telethon.tl.types import MessageMediaDocument
+from telethon import TelegramClient
 from aiohttp import web
 
 BOT_TOKEN = "8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms"
-API_ID = 0        # ← put your api_id here
-API_HASH = ""     # ← put your api_hash here
+API_ID = 32829360
+API_HASH = "34d8ba335bd2b39c9cca0856f680f3d5"
 SESSION_NAME = "relay_session"
-CHANNEL_USERNAME = "@ipapkornS2botdatabase"  # the channel your account is in
+CHANNEL_USERNAME = "@ipapkornS2botdatabase"
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -53,29 +52,30 @@ async def search(message: types.Message):
     await message.answer(f"🔍 Searching channel for <b>{query}</b>...", parse_mode="HTML")
 
     try:
-        # Get channel entity using your account's access
         channel = await client.get_entity(CHANNEL_USERNAME)
 
-        # Try Telegram's search first
         results = []
-        async for msg in client.iter_messages(channel, search=query, limit=20):
-            if msg.message and msg.message.lower().find(query.lower()) != -1 or (msg.file and msg.file.name and query.lower() in msg.file.name.lower()):
-                title = msg.message or (msg.file.name if msg.file else "File")
-                # Get download link or file ID
-                link = None
-                if msg.media:
-                    # For documents, use t.me link to the message
-                    link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}/{msg.id}"
-                results.append({
-                    "title": title,
-                    "link": link,
-                    "message_id": msg.id,
-                })
-                if len(results) >= 10:
-                    break
 
+        # Try Telegram's search first
+        async for msg in client.iter_messages(channel, search=query, limit=20):
+            title = ""
+            if msg.message:
+                title = msg.message
+            elif msg.file and msg.file.name:
+                title = msg.file.name
+            else:
+                continue
+
+            if query.lower() not in title.lower():
+                continue
+
+            link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}/{msg.id}"
+            results.append({"title": title, "link": link})
+            if len(results) >= 10:
+                break
+
+        # Fallback: scan recent 100 messages
         if not results:
-            # Fallback: scan recent messages
             async for msg in client.iter_messages(channel, limit=100):
                 title = ""
                 if msg.message:
@@ -84,15 +84,14 @@ async def search(message: types.Message):
                     title = msg.file.name
                 else:
                     continue
-                if query.lower() in title.lower():
-                    link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}/{msg.id}"
-                    results.append({
-                        "title": title,
-                        "link": link,
-                        "message_id": msg.id,
-                    })
-                    if len(results) >= 10:
-                        break
+
+                if query.lower() not in title.lower():
+                    continue
+
+                link = f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}/{msg.id}"
+                results.append({"title": title, "link": link})
+                if len(results) >= 10:
+                    break
 
         if not results:
             await message.answer(f"❌ No results found for <b>{query}</b>.", parse_mode="HTML")
@@ -101,9 +100,10 @@ async def search(message: types.Message):
         text = f"🎬 <b>Search Results for:</b> <code>{query}</code>\n\n"
         kb_buttons = []
         for i, r in enumerate(results[:10], 1):
-            title = r["title"][:120]
-            text += f"{i}. <b>{title}</b>\n\n"
+            clean_title = re.sub(r'<[^>]+>', '', r['title'])[:120]
+            text += f"{i}. <b>{clean_title}</b>\n\n"
             kb_buttons.append([InlineKeyboardButton(text=f"⬇️ Download {i}", url=r["link"])])
+
         kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
         await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
