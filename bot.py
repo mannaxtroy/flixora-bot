@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flixora MovieBox - Group Relay with iPapkornS2bot
-No Telethon, no API, no session. Pure aiogram.
+Flixora MovieBox - Telegram Channel Scraper
+Searches public channels via t.me/s/ pages.
 """
 
 import os
@@ -10,13 +10,14 @@ import re
 import asyncio
 import logging
 from datetime import datetime
+import httpx
+from bs4 import BeautifulSoup
 from aiohttp import web
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = "8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms"
-IPAPKORN_USERNAME = "iPapkornS2bot"  # without @
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,148 +27,163 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Runtime-set via /setgroup or forwarded message
-GROUP_CHAT_ID = None
-# Store which user is waiting: query_lower -> user_id
-waiting_users = {}
+# Default channels — add more with /addchannel
+DEFAULT_CHANNELS = [
+    # Add known public movie/series channels here (optional)
+]
+
+# In-memory channel list (lost on restart; use a file if needed)
+channel_list = list(DEFAULT_CHANNELS)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+def clean_text(t):
+    return re.sub(r'\s+', ' ', t or '').strip()
+
+async def search_channel(channel: str, query: str) -> list:
+    """
+    Scrape t.me/s/<channel>?q=<query> for posts with download links.
+    Returns list of dicts: {title, link}
+    """
+    results = []
+    try:
+        username = channel.lstrip('@')
+        url = f"https://t.me/s/{username}?q={query.replace(' ', '+')}"
+        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning(f"Channel {channel} returned {resp.status_code}")
+                return []
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Telegram web preview posts are in div.tgme_widget_message
+            posts = soup.select("div.tgme_widget_message")
+            for post in posts:
+                # Extract text from post
+                text_elem = post.select_one("div.tgme_widget_message_text")
+                text = clean_text(text_elem.get_text()) if text_elem else ""
+                if not text:
+                    continue
+                # Match query in text (Telegram web does filtering already, but double-check)
+                if query.lower() not in text.lower():
+                    continue
+                # Extract all links from post
+                links = []
+                for a in post.select("a.tgme_widget_message_link"):
+                    href = a.get("href", "")
+                    if href and href not in links:
+                        links.append(href)
+                # Also check inline text for URLs
+                if text_elem:
+                    for a in text_elem.select("a"):
+                        href = a.get("href", "")
+                        if href and href not in links:
+                            links.append(href)
+                if links:
+                    results.append({
+                        "title": text[:150],
+                        "link": links[0],  # primary link
+                        "all_links": links,
+                        "channel": channel,
+                    })
+    except Exception as e:
+        logger.warning(f"Error searching channel {channel}: {e}")
+    return results
+
+async def global_channel_search(query: str, limit: int = 20) -> list:
+    """Search all channels in list, merge results."""
+    all_results = []
+    for channel in channel_list:
+        res = await search_channel(channel, query)
+        all_results.extend(res)
+        if len(all_results) >= limit:
+            break
+    return all_results[:limit]
+
+def format_results(results, query):
+    """Format for Telegram with buttons."""
+    if not results:
+        return None, None
+    text = f"🎬 <b>Search Results for:</b> <code>{query}</code>\n\n"
+    kb_buttons = []
+    for i, r in enumerate(results[:10], 1):
+        title = clean_text(r['title'])[:80]
+        text += f"{i}. <b>{title}</b>\n   📁 {r['channel']}\n\n"
+        # Add button for each link (up to 3 per result)
+        for j, link in enumerate(r['all_links'][:3], 1):
+            kb_buttons.append([InlineKeyboardButton(text=f"⬇️ {i}.{j}", url=link)])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
+    return text, kb
 
 @router.message(CommandStart())
 async def start(message: types.Message):
     await message.answer(
         "🎬 <b>Flixora MovieBox</b>\n\n"
-        "Send me any movie or series name with proper spelling.\n"
-        "I'll search through iPapkorn's library and return your files with download buttons.\n\n"
-        "Example:\n"
-        "<code>House of the Dragon</code>\n"
-        "<code>Inception</code>\n\n"
-        "Use /setgroup to connect the relay group.",
+        "I search public Telegram channels for direct download links.\n\n"
+        "Commands:\n"
+        "/addchannel @username - Add a channel\n"
+        "/channels - List channels\n"
+        "/removechannel @username - Remove channel\n\n"
+        "Send me a movie or series name to search.",
         parse_mode="HTML"
     )
 
-@router.message(Command("setgroup"))
-async def set_group(message: types.Message):
-    global GROUP_CHAT_ID
-    # If sent in a group, set directly
-    if message.chat.type in ("group", "supergroup"):
-        GROUP_CHAT_ID = message.chat.id
-        await message.answer(f"✅ This group is now the relay group.\nChat ID: <code>{GROUP_CHAT_ID}</code>", parse_mode="HTML")
+@router.message(Command("addchannel"))
+async def add_channel(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /addchannel @username")
         return
-
-    # If sent privately, ask for a forwarded message from the group
-    await message.answer(
-        "📨 Please <b>forward any message from the group</b> where both bots are present.\n"
-        "Or send the group chat ID directly: <code>/setgroup -1001234567890</code>",
-        parse_mode="HTML"
-    )
-
-@router.message(lambda m: m.forward_from_chat is not None)
-async def forwarded_group(message: types.Message):
-    global GROUP_CHAT_ID
-    chat = message.forward_from_chat
-    if chat and chat.type in ("group", "supergroup", "channel"):
-        GROUP_CHAT_ID = chat.id
-        await message.answer(f"✅ Relay group set!\nChat ID: <code>{GROUP_CHAT_ID}</code>\nNow send me a movie name.", parse_mode="HTML")
+    channel = args[1].lstrip('@')
+    if channel not in channel_list:
+        channel_list.append(channel)
+        await message.answer(f"✅ Added @{channel}")
     else:
-        await message.answer("❌ That doesn't look like a group. Forward a message from the actual relay group.")
+        await message.answer(f"@{channel} already in list.")
 
-@router.message(Command("status"))
-async def status(message: types.Message):
-    if GROUP_CHAT_ID:
-        await message.answer(f"✅ Relay group connected.\nChat ID: <code>{GROUP_CHAT_ID}</code>", parse_mode="HTML")
+@router.message(Command("removechannel"))
+async def remove_channel(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Usage: /removechannel @username")
+        return
+    channel = args[1].lstrip('@')
+    if channel in channel_list:
+        channel_list.remove(channel)
+        await message.answer(f"✅ Removed @{channel}")
     else:
-        await message.answer("❌ Relay group not set.\nCreate a group, add @FlixoraScraperbot and @iPapkornS2bot, then forward a message from that group to me here.")
+        await message.answer(f"@{channel} not in list.")
+
+@router.message(Command("channels"))
+async def list_channels(message: types.Message):
+    if not channel_list:
+        await message.answer("No channels added. Use /addchannel to add one.")
+        return
+    text = "📋 <b>Channels:</b>\n\n" + "\n".join([f"@{c}" for c in channel_list])
+    await message.answer(text, parse_mode="HTML")
 
 @router.message(F.text, lambda m: m.chat.type == "private")
-async def user_search(message: types.Message):
-    if not GROUP_CHAT_ID:
-        await message.answer(
-            "❌ Relay group not set.\n\n"
-            "1. Create a group\n"
-            "2. Add @FlixoraScraperbot and @iPapkornS2bot\n"
-            "3. Forward any message from that group to me here\n"
-            "4. Then send your search again.",
-            parse_mode="HTML"
-        )
-        return
-
+async def search(message: types.Message):
     query = message.text.strip()
     if not query:
         return
-
-    waiting_users[query.lower()] = message.from_user.id
-    await message.bot.send_chat_action(message.chat.id, "typing")
-    await message.answer(f"🔍 Searching for <b>{query}</b> via iPapkorn...", parse_mode="HTML")
-
-    try:
-        # Send query to group where iPapkorn will respond
-        await bot.send_message(GROUP_CHAT_ID, query)
-    except Exception as e:
-        logger.error(f"Failed to send to group: {e}")
-        await message.answer("❌ Failed to send query to relay group. Make sure @FlixoraScraperbot is a member of the group.")
-
-@router.message(F.text, lambda m: m.chat.type in ("group", "supergroup"))
-async def group_reply(message: types.Message):
-    if not message.text:
-        return
-
-    # Only listen to replies from iPapkorn
-    sender = message.from_user.username.lower() if message.from_user and message.from_user.username else ""
-    if sender != IPAPKORN_USERNAME.lower():
-        return
-
-    # Find which user this reply belongs to
-    user_id = None
-    for query, uid in list(waiting_users.items()):
-        if query in message.text.lower():
-            user_id = uid
-            del waiting_users[query]
-            break
-
-    # If no match, send to the last waiting user
-    if not user_id and waiting_users:
-        last_query = list(waiting_users.keys())[-1]
-        user_id = waiting_users.pop(last_query)
-
-    if not user_id:
-        logger.warning("Reply from iPapkorn but no waiting user")
-        return
-
-    # Build inline keyboard from buttons
-    kb = None
-    if message.reply_markup and message.reply_markup.inline_keyboard:
-        rows = []
-        for row in message.reply_markup.inline_keyboard:
-            btn_row = []
-            for btn in row:
-                if btn.url:
-                    btn_row.append(InlineKeyboardButton(text=btn.text, url=btn.url))
-                elif btn.data:
-                    btn_row.append(InlineKeyboardButton(text=btn.text, callback_data=btn.data))
-            if btn_row:
-                rows.append(btn_row)
-        if rows:
-            kb = InlineKeyboardMarkup(inline_keyboard=rows)
-
-    try:
-        await bot.send_message(
-            user_id,
-            message.text,
-            parse_mode="HTML",
-            reply_markup=kb,
-            disable_web_page_preview=True
+    if not channel_list:
+        await message.answer(
+            "❌ No channels configured.\n\n"
+            "Use /addchannel @channelname to add public channels that share download links.",
+            parse_mode="HTML"
         )
-        logger.info(f"Relayed iPapkorn reply to user {user_id}")
-    except Exception as e:
-        logger.error(f"Failed to relay to user: {e}")
-        try:
-            await bot.send_message(
-                user_id,
-                message.text,
-                reply_markup=kb,
-                disable_web_page_preview=True
-            )
-        except:
-            pass
+        return
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    await message.answer(f"🔍 Searching channels for <b>{query}</b>...", parse_mode="HTML")
+    results = await global_channel_search(query)
+    text, kb = format_results(results, query)
+    if not text:
+        await message.answer(f"❌ No results found for <b>{query}</b> in configured channels.", parse_mode="HTML")
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
 async def health_check(request):
     return web.Response(text="OK", status=200)
