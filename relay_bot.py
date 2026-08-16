@@ -14,7 +14,7 @@ BOT_TOKEN = "8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms"
 API_ID = 32829360
 API_HASH = "34d8ba335bd2b39c9cca0856f680f3d5"
 SESSION_NAME = "relay_session"
-IPAPKORN_USERNAME = "@iPopkornbot"
+IPAPKORN_USERNAME = "@iPapkornS2bot"
 PORT = int(os.getenv("PORT", "10000"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
