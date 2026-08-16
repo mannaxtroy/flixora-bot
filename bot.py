@@ -4,6 +4,7 @@
 Flixora MovieBox - Telegram Channel Scraper
 Searches public channels via t.me/s/ pages.
 Supports pagination, document title extraction, and forwarded channel detection.
+DEBUG LOGGING ADDED.
 """
 
 import os
@@ -28,10 +29,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Default channels — @ipapkornS2botdatabase is already added so you don't have to re-add it.
+# Default channel
 DEFAULT_CHANNELS = ["ipapkornS2botdatabase"]
-
-# In-memory channel list (initialized with default)
 channel_list = list(DEFAULT_CHANNELS)
 
 HEADERS = {
@@ -47,7 +46,7 @@ def clean_text(t):
 def extract_post_full_text(post):
     """
     Extract searchable text from a Telegram web preview post.
-    Includes message text, caption, document title, and media title.
+    Includes message text, caption, document title, media title.
     """
     parts = []
 
@@ -71,7 +70,7 @@ def extract_post_full_text(post):
     if media_title:
         parts.append(clean_text(media_title.get_text()))
 
-    # Fallback: any nested title-like element
+    # Fallback nested selectors
     if not parts:
         for sel in [
             "a.tgme_widget_message_document_title",
@@ -88,14 +87,13 @@ def extract_post_full_text(post):
 async def extract_post_links(post):
     """
     Extract all download links from a Telegram post element.
-    Covers text links, caption links, document download buttons,
-    and follows document URLs to final file if needed.
+    Includes document download buttons and fallback to post link.
     """
     links = []
 
-    # All links inside message text / caption
-    for elem in post.select("a"):
-        href = elem.get("href", "")
+    # All links inside message text / caption / document
+    for a in post.select("a"):
+        href = a.get("href", "")
         if href and href not in links:
             links.append(href)
 
@@ -105,7 +103,7 @@ async def extract_post_links(post):
         if href and href not in links:
             links.append(href)
 
-    # If no direct links yet, resolve document URL to final file URL
+    # If no direct links, try to resolve document URL to final file URL
     if not links:
         doc = post.select_one("a.tgme_widget_message_download")
         if doc:
@@ -120,6 +118,14 @@ async def extract_post_links(post):
                 except:
                     pass
 
+    # Fallback: add post link so user can open and download from Telegram
+    if not links:
+        date_link = post.select_one("a.tgme_widget_message_date")
+        if date_link:
+            href = date_link.get("href", "")
+            if href and href not in links:
+                links.append(href)
+
     return links
 
 
@@ -132,45 +138,53 @@ async def search_channel(channel: str, query: str) -> list:
     try:
         username = channel.lstrip('@')
         base = f"https://t.me/s/{username}"
+        logger.info(f"Searching channel @{username} for: {query}")
 
         async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
             # ── 1) Try Telegram built-in search ──
             search_url = f"{base}?q={query.replace(' ', '+')}"
             resp = await client.get(search_url)
+            logger.info(f"Built-in search status for @{username}: {resp.status_code}")
+
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 posts = soup.select("div.tgme_widget_message")
-                if posts:
-                    for post in posts:
-                        full_text = extract_post_full_text(post).lower()
-                        if query.lower() not in full_text:
-                            continue
-                        links = await extract_post_links(post)
-                        if links:
-                            title = full_text[:150]
-                            results.append({
-                                "title": title,
-                                "link": links[0],
-                                "all_links": links,
-                                "channel": channel,
-                            })
-                    if results:
-                        return results
+                logger.info(f"Built-in search found {len(posts)} posts")
+                for post in posts:
+                    full_text = extract_post_full_text(post).lower()
+                    logger.debug(f"Post text: {full_text[:100]}")
+                    if query.lower() not in full_text:
+                        continue
+                    links = await extract_post_links(post)
+                    if links:
+                        title = full_text[:150]
+                        results.append({
+                            "title": title,
+                            "link": links[0],
+                            "all_links": links,
+                            "channel": channel,
+                        })
+                if results:
+                    logger.info(f"Found {len(results)} results via built-in search")
+                    return results
 
             # ── 2) Fallback: paginate recent posts up to 10 pages ──
             next_url = base
-            for _ in range(10):
+            for page in range(10):
                 resp = await client.get(next_url)
+                logger.info(f"Page {page+1} status: {resp.status_code}")
                 if resp.status_code != 200:
                     break
                 soup = BeautifulSoup(resp.text, "html.parser")
                 posts = soup.select("div.tgme_widget_message")
+                logger.info(f"Page {page+1} contains {len(posts)} posts")
                 if not posts:
                     break
 
                 found = False
-                for post in posts:
+                for idx, post in enumerate(posts[:5], 1):
                     full_text = extract_post_full_text(post).lower()
+                    logger.info(f"Post {idx}: {full_text[:120]}")
                     if query.lower() not in full_text:
                         continue
                     links = await extract_post_links(post)
@@ -185,11 +199,12 @@ async def search_channel(channel: str, query: str) -> list:
                         found = True
 
                 if found:
+                    logger.info(f"Found {len(results)} results on page {page+1}")
                     break
 
-                # Look for "older posts" link
                 older = soup.select_one("a.tme_messages_more")
                 if not older:
+                    logger.info("No older posts link found")
                     break
                 href = older.get("href", "")
                 if href.startswith("/"):
@@ -198,11 +213,13 @@ async def search_channel(channel: str, query: str) -> list:
                     next_url = href
                 else:
                     break
+                logger.info(f"Next page URL: {next_url}")
 
+            logger.info(f"Total results for @{username}: {len(results)}")
             return results
 
     except Exception as e:
-        logger.warning(f"Error searching channel {channel}: {e}")
+        logger.error(f"Error searching channel {channel}: {e}")
         return results
 
 
