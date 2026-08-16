@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: flixora-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        value: 8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms
+      - key: REDIS_URL
+        value: redis://default:gQAAAAAAAg1oAAIgcDJiN2I5OTQ0MjcxMmU0NmVlYTU4NmYxYjI3ZThhYmZiNw@powerful-alien-134504.upstash.io:6379
+      - key: TMDB_API_KEY
+        value: a0a6d5683fba540c701631e68bbcc117
+      - key: RENDER_APP_URL
+        value: https://flixora-bot-xtzp.onrender.com
+      - key: MAX_RESULTS
+        value: "20"
+      - key: CACHE_TTL
+        value: "300"
+      - key: PORT
+        value: "8000"
+      - key: LOG_LEVEL
+        value: "INFO"
