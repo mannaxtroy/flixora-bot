@@ -13,8 +13,8 @@ from datetime import datetime
 
 # ─── CREDENTIALS ───
 BOT_TOKEN = "8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms"
-API_ID = 0        # ← replace with your api_id
-API_HASH = ""     # ← replace with your api_hash
+API_ID = 32829360        # ← replace with your api_id
+API_HASH = "34d8ba335bd2b39c9cca0856f680f3d5"     # ← replace with your api_hash
 SESSION_NAME = "relay_session"
 IPAPKORN_USERNAME = "@iPapkornS2bot"
 PORT = int(os.getenv("PORT", "10000"))
