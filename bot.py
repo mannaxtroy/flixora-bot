@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flixora MovieBox — Group Relay with iPapkornS2bot
-One file. No API ID. No session. Ready to deploy.
+Flixora MovieBox - Group Relay with iPapkornS2bot
+No Telethon, no API, no session. Pure aiogram.
 """
 
 import os
@@ -26,10 +26,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
+# Runtime-set via /setgroup or forwarded message
 GROUP_CHAT_ID = None
-waiting_users = {}  # query -> user_id
+# Store which user is waiting: query_lower -> user_id
+waiting_users = {}
 
-# ─── START ───
 @router.message(CommandStart())
 async def start(message: types.Message):
     await message.answer(
@@ -38,38 +39,44 @@ async def start(message: types.Message):
         "I'll search through iPapkorn's library and return your files with download buttons.\n\n"
         "Example:\n"
         "<code>House of the Dragon</code>\n"
-        "<code>Inception</code>",
+        "<code>Inception</code>\n\n"
+        "Use /setgroup to connect the relay group.",
         parse_mode="HTML"
     )
 
-# ─── SET RELAY GROUP ───
 @router.message(Command("setgroup"))
 async def set_group(message: types.Message):
     global GROUP_CHAT_ID
+    # If sent in a group, set directly
     if message.chat.type in ("group", "supergroup"):
         GROUP_CHAT_ID = message.chat.id
-        await message.answer(
-            f"✅ This group is now the relay group.\nChat ID: <code>{GROUP_CHAT_ID}</code>",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer("❌ Send /setgroup in the group where both bots are present.")
+        await message.answer(f"✅ This group is now the relay group.\nChat ID: <code>{GROUP_CHAT_ID}</code>", parse_mode="HTML")
+        return
 
-# ─── STATUS ───
+    # If sent privately, ask for a forwarded message from the group
+    await message.answer(
+        "📨 Please <b>forward any message from the group</b> where both bots are present.\n"
+        "Or send the group chat ID directly: <code>/setgroup -1001234567890</code>",
+        parse_mode="HTML"
+    )
+
+@router.message(lambda m: m.forward_from_chat is not None)
+async def forwarded_group(message: types.Message):
+    global GROUP_CHAT_ID
+    chat = message.forward_from_chat
+    if chat and chat.type in ("group", "supergroup", "channel"):
+        GROUP_CHAT_ID = chat.id
+        await message.answer(f"✅ Relay group set!\nChat ID: <code>{GROUP_CHAT_ID}</code>\nNow send me a movie name.", parse_mode="HTML")
+    else:
+        await message.answer("❌ That doesn't look like a group. Forward a message from the actual relay group.")
+
 @router.message(Command("status"))
 async def status(message: types.Message):
     if GROUP_CHAT_ID:
-        await message.answer(
-            f"✅ Relay group connected.\nChat ID: <code>{GROUP_CHAT_ID}</code>",
-            parse_mode="HTML"
-        )
+        await message.answer(f"✅ Relay group connected.\nChat ID: <code>{GROUP_CHAT_ID}</code>", parse_mode="HTML")
     else:
-        await message.answer(
-            "❌ Relay group not set.\n"
-            "Create a group, add @FlixoraScraperbot and @iPapkornS2bot, then send /setgroup in that group."
-        )
+        await message.answer("❌ Relay group not set.\nCreate a group, add @FlixoraScraperbot and @iPapkornS2bot, then forward a message from that group to me here.")
 
-# ─── PRIVATE SEARCH ───
 @router.message(F.text, lambda m: m.chat.type == "private")
 async def user_search(message: types.Message):
     if not GROUP_CHAT_ID:
@@ -77,8 +84,8 @@ async def user_search(message: types.Message):
             "❌ Relay group not set.\n\n"
             "1. Create a group\n"
             "2. Add @FlixoraScraperbot and @iPapkornS2bot\n"
-            "3. Send /setgroup in that group\n"
-            "4. Then send your search here again.",
+            "3. Forward any message from that group to me here\n"
+            "4. Then send your search again.",
             parse_mode="HTML"
         )
         return
@@ -92,21 +99,23 @@ async def user_search(message: types.Message):
     await message.answer(f"🔍 Searching for <b>{query}</b> via iPapkorn...", parse_mode="HTML")
 
     try:
+        # Send query to group where iPapkorn will respond
         await bot.send_message(GROUP_CHAT_ID, query)
     except Exception as e:
         logger.error(f"Failed to send to group: {e}")
-        await message.answer("❌ Failed to send query to relay group.")
+        await message.answer("❌ Failed to send query to relay group. Make sure @FlixoraScraperbot is a member of the group.")
 
-# ─── LISTEN TO iPAPKORN IN GROUP ───
 @router.message(F.text, lambda m: m.chat.type in ("group", "supergroup"))
 async def group_reply(message: types.Message):
     if not message.text:
         return
 
+    # Only listen to replies from iPapkorn
     sender = message.from_user.username.lower() if message.from_user and message.from_user.username else ""
     if sender != IPAPKORN_USERNAME.lower():
         return
 
+    # Find which user this reply belongs to
     user_id = None
     for query, uid in list(waiting_users.items()):
         if query in message.text.lower():
@@ -114,6 +123,7 @@ async def group_reply(message: types.Message):
             del waiting_users[query]
             break
 
+    # If no match, send to the last waiting user
     if not user_id and waiting_users:
         last_query = list(waiting_users.keys())[-1]
         user_id = waiting_users.pop(last_query)
@@ -122,6 +132,7 @@ async def group_reply(message: types.Message):
         logger.warning("Reply from iPapkorn but no waiting user")
         return
 
+    # Build inline keyboard from buttons
     kb = None
     if message.reply_markup and message.reply_markup.inline_keyboard:
         rows = []
@@ -158,7 +169,6 @@ async def group_reply(message: types.Message):
         except:
             pass
 
-# ─── HEALTH SERVER ───
 async def health_check(request):
     return web.Response(text="OK", status=200)
 
@@ -172,7 +182,6 @@ async def start_web_server():
     await site.start()
     logger.info(f"Health server on port {PORT}")
 
-# ─── MAIN ───
 async def main():
     await start_web_server()
     dp.include_router(router)
