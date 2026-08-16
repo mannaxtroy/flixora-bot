@@ -3,7 +3,7 @@
 """
 Flixora MovieBox - Telegram Channel Scraper
 Searches public channels via t.me/s/ pages.
-Supports pagination, document link extraction, and forwarded message channel detection.
+Supports pagination, document title extraction, and forwarded channel detection.
 """
 
 import os
@@ -28,19 +28,64 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# In-memory channel list (lost on restart; use a file if needed)
-channel_list = []
+# Default channels — @ipapkornS2botdatabase is already added so you don't have to re-add it.
+DEFAULT_CHANNELS = ["ipapkornS2botdatabase"]
+
+# In-memory channel list (initialized with default)
+channel_list = list(DEFAULT_CHANNELS)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+
 def clean_text(t):
     return re.sub(r'\s+', ' ', t or '').strip()
 
 
-async def extract_post_links(post, text_elem, caption_elem):
+def extract_post_full_text(post):
+    """
+    Extract searchable text from a Telegram web preview post.
+    Includes message text, caption, document title, and media title.
+    """
+    parts = []
+
+    # Message text
+    text_elem = post.select_one("div.tgme_widget_message_text")
+    if text_elem:
+        parts.append(clean_text(text_elem.get_text()))
+
+    # Caption
+    caption_elem = post.select_one("div.tgme_widget_message_caption")
+    if caption_elem:
+        parts.append(clean_text(caption_elem.get_text()))
+
+    # Document title (file name)
+    doc_title = post.select_one("div.tgme_widget_message_document_title")
+    if doc_title:
+        parts.append(clean_text(doc_title.get_text()))
+
+    # Media title (for audio/video)
+    media_title = post.select_one("div.tgme_widget_message_media_title")
+    if media_title:
+        parts.append(clean_text(media_title.get_text()))
+
+    # Fallback: any nested title-like element
+    if not parts:
+        for sel in [
+            "a.tgme_widget_message_document_title",
+            "span.tgme_widget_message_media_title",
+            "div.tgme_widget_message_document_extra"
+        ]:
+            elem = post.select_one(sel)
+            if elem:
+                parts.append(clean_text(elem.get_text()))
+
+    return " ".join(parts)
+
+
+async def extract_post_links(post):
     """
     Extract all download links from a Telegram post element.
     Covers text links, caption links, document download buttons,
@@ -48,13 +93,11 @@ async def extract_post_links(post, text_elem, caption_elem):
     """
     links = []
 
-    # Text and caption links
-    for elem in [text_elem, caption_elem]:
-        if elem:
-            for a in elem.select("a"):
-                href = a.get("href", "")
-                if href and href not in links:
-                    links.append(href)
+    # All links inside message text / caption
+    for elem in post.select("a"):
+        href = elem.get("href", "")
+        if href and href not in links:
+            links.append(href)
 
     # Document download buttons
     for a in post.select("a.tgme_widget_message_download"):
@@ -62,7 +105,7 @@ async def extract_post_links(post, text_elem, caption_elem):
         if href and href not in links:
             links.append(href)
 
-    # If no direct links yet, try to resolve document URL to final file
+    # If no direct links yet, resolve document URL to final file URL
     if not links:
         doc = post.select_one("a.tgme_widget_message_download")
         if doc:
@@ -99,16 +142,12 @@ async def search_channel(channel: str, query: str) -> list:
                 posts = soup.select("div.tgme_widget_message")
                 if posts:
                     for post in posts:
-                        text_elem = post.select_one("div.tgme_widget_message_text")
-                        caption_elem = post.select_one("div.tgme_widget_message_caption")
-                        text = clean_text(text_elem.get_text()) if text_elem else ""
-                        caption = clean_text(caption_elem.get_text()) if caption_elem else ""
-                        combined = (text + " " + caption).lower()
-                        if query.lower() not in combined:
+                        full_text = extract_post_full_text(post).lower()
+                        if query.lower() not in full_text:
                             continue
-                        links = await extract_post_links(post, text_elem, caption_elem)
+                        links = await extract_post_links(post)
                         if links:
-                            title = text[:150] if text else caption[:150]
+                            title = full_text[:150]
                             results.append({
                                 "title": title,
                                 "link": links[0],
@@ -131,16 +170,12 @@ async def search_channel(channel: str, query: str) -> list:
 
                 found = False
                 for post in posts:
-                    text_elem = post.select_one("div.tgme_widget_message_text")
-                    caption_elem = post.select_one("div.tgme_widget_message_caption")
-                    text = clean_text(text_elem.get_text()) if text_elem else ""
-                    caption = clean_text(caption_elem.get_text()) if caption_elem else ""
-                    combined = (text + " " + caption).lower()
-                    if query.lower() not in combined:
+                    full_text = extract_post_full_text(post).lower()
+                    if query.lower() not in full_text:
                         continue
-                    links = await extract_post_links(post, text_elem, caption_elem)
+                    links = await extract_post_links(post)
                     if links:
-                        title = text[:150] if text else caption[:150]
+                        title = full_text[:150]
                         results.append({
                             "title": title,
                             "link": links[0],
@@ -194,7 +229,6 @@ def format_results(results, query):
         title = clean_text(r['title'])[:80]
         text += f"{i}. <b>{title}</b>\n   📁 {r['channel']}\n\n"
 
-        # Add a button for each link (up to 3 per result)
         for j, link in enumerate(r['all_links'][:3], 1):
             kb_buttons.append([InlineKeyboardButton(text=f"⬇️ {i}.{j}", url=link)])
 
@@ -243,7 +277,6 @@ async def forwarded_channel_add(message: types.Message):
     chat = message.forward_from_chat
     if not chat:
         return
-    # If chat has a username, add it
     if chat.username:
         channel = chat.username
         if channel not in channel_list:
