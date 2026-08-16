@@ -10,3 +10,5 @@ services:
         value: 8914900872:AAHZVd2EHww1KwnGFQaEOjPeYI9l02nT7Ms
       - key: PORT
         value: "10000"
+      - key: MOVIEBOX_API
+        value: "https://moviebox-api.vercel.app"
