@@ -3,6 +3,7 @@
 """
 Flixora MovieBox - Telegram Channel Scraper
 Searches public channels via t.me/s/ pages.
+Supports pagination and document link extraction.
 """
 
 import os
@@ -27,12 +28,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Default channels — add more with /addchannel
-DEFAULT_CHANNELS = [
-    # Add known public movie/series channels here (optional)
-]
+# Default channels — can be pre-filled if you want
+DEFAULT_CHANNELS = []
 
-# In-memory channel list (lost on restart; use a file if needed)
+# In-memory channel list (lost on restart)
 channel_list = list(DEFAULT_CHANNELS)
 
 HEADERS = {
@@ -43,57 +42,140 @@ HEADERS = {
 def clean_text(t):
     return re.sub(r'\s+', ' ', t or '').strip()
 
+
+async def extract_post_links(post, text_elem, caption_elem):
+    """
+    Extract all download links from a Telegram post element.
+    Covers text links, caption links, document download buttons,
+    and follows document URLs to final file if needed.
+    """
+    links = []
+
+    # Text and caption links
+    for elem in [text_elem, caption_elem]:
+        if elem:
+            for a in elem.select("a"):
+                href = a.get("href", "")
+                if href and href not in links:
+                    links.append(href)
+
+    # Document download buttons
+    for a in post.select("a.tgme_widget_message_download"):
+        href = a.get("href", "")
+        if href and href not in links:
+            links.append(href)
+
+    # If no direct links yet, try to resolve document URL to final file
+    if not links:
+        doc = post.select_one("a.tgme_widget_message_download")
+        if doc:
+            href = doc.get("href", "")
+            if href:
+                try:
+                    async with httpx.AsyncClient(headers=HEADERS, timeout=10, follow_redirects=True) as client:
+                        r = await client.get(href)
+                        final = str(r.url)
+                        if final and final not in links:
+                            links.append(final)
+                except:
+                    pass
+
+    return links
+
+
 async def search_channel(channel: str, query: str) -> list:
     """
-    Scrape t.me/s/<channel>?q=<query> for posts with download links.
-    Returns list of dicts: {title, link}
+    Scrape t.me/s/<channel> for posts matching query.
+    First tries Telegram's own search (?q=), then paginates recent posts.
     """
     results = []
     try:
         username = channel.lstrip('@')
-        url = f"https://t.me/s/{username}?q={query.replace(' ', '+')}"
+        base = f"https://t.me/s/{username}"
+
         async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                logger.warning(f"Channel {channel} returned {resp.status_code}")
-                return []
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Telegram web preview posts are in div.tgme_widget_message
-            posts = soup.select("div.tgme_widget_message")
-            for post in posts:
-                # Extract text from post
-                text_elem = post.select_one("div.tgme_widget_message_text")
-                text = clean_text(text_elem.get_text()) if text_elem else ""
-                if not text:
-                    continue
-                # Match query in text (Telegram web does filtering already, but double-check)
-                if query.lower() not in text.lower():
-                    continue
-                # Extract all links from post
-                links = []
-                for a in post.select("a.tgme_widget_message_link"):
-                    href = a.get("href", "")
-                    if href and href not in links:
-                        links.append(href)
-                # Also check inline text for URLs
-                if text_elem:
-                    for a in text_elem.select("a"):
-                        href = a.get("href", "")
-                        if href and href not in links:
-                            links.append(href)
-                if links:
-                    results.append({
-                        "title": text[:150],
-                        "link": links[0],  # primary link
-                        "all_links": links,
-                        "channel": channel,
-                    })
+            # ── 1) Try Telegram built-in search ──
+            search_url = f"{base}?q={query.replace(' ', '+')}"
+            resp = await client.get(search_url)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                posts = soup.select("div.tgme_widget_message")
+                if posts:
+                    for post in posts:
+                        text_elem = post.select_one("div.tgme_widget_message_text")
+                        caption_elem = post.select_one("div.tgme_widget_message_caption")
+                        text = clean_text(text_elem.get_text()) if text_elem else ""
+                        caption = clean_text(caption_elem.get_text()) if caption_elem else ""
+                        combined = (text + " " + caption).lower()
+                        if query.lower() not in combined:
+                            continue
+                        links = await extract_post_links(post, text_elem, caption_elem)
+                        if links:
+                            title = text[:150] if text else caption[:150]
+                            results.append({
+                                "title": title,
+                                "link": links[0],
+                                "all_links": links,
+                                "channel": channel,
+                            })
+                    if results:
+                        return results
+
+            # ── 2) Fallback: paginate recent posts up to 10 pages ──
+            next_url = base
+            for _ in range(10):
+                resp = await client.get(next_url)
+                if resp.status_code != 200:
+                    break
+                soup = BeautifulSoup(resp.text, "html.parser")
+                posts = soup.select("div.tgme_widget_message")
+                if not posts:
+                    break
+
+                found = False
+                for post in posts:
+                    text_elem = post.select_one("div.tgme_widget_message_text")
+                    caption_elem = post.select_one("div.tgme_widget_message_caption")
+                    text = clean_text(text_elem.get_text()) if text_elem else ""
+                    caption = clean_text(caption_elem.get_text()) if caption_elem else ""
+                    combined = (text + " " + caption).lower()
+                    if query.lower() not in combined:
+                        continue
+                    links = await extract_post_links(post, text_elem, caption_elem)
+                    if links:
+                        title = text[:150] if text else caption[:150]
+                        results.append({
+                            "title": title,
+                            "link": links[0],
+                            "all_links": links,
+                            "channel": channel,
+                        })
+                        found = True
+
+                if found:
+                    break
+
+                # Look for "older posts" link
+                older = soup.select_one("a.tme_messages_more")
+                if not older:
+                    break
+                href = older.get("href", "")
+                if href.startswith("/"):
+                    next_url = f"https://t.me{href}"
+                elif href.startswith("http"):
+                    next_url = href
+                else:
+                    break
+
+            return results
+
     except Exception as e:
         logger.warning(f"Error searching channel {channel}: {e}")
-    return results
+        return results
+
 
 async def global_channel_search(query: str, limit: int = 20) -> list:
-    """Search all channels in list, merge results."""
+    """Search all configured channels, merge results."""
     all_results = []
     for channel in channel_list:
         res = await search_channel(channel, query)
@@ -102,20 +184,28 @@ async def global_channel_search(query: str, limit: int = 20) -> list:
             break
     return all_results[:limit]
 
+
 def format_results(results, query):
-    """Format for Telegram with buttons."""
+    """Format results for Telegram with download buttons."""
     if not results:
         return None, None
+
     text = f"🎬 <b>Search Results for:</b> <code>{query}</code>\n\n"
     kb_buttons = []
+
     for i, r in enumerate(results[:10], 1):
         title = clean_text(r['title'])[:80]
         text += f"{i}. <b>{title}</b>\n   📁 {r['channel']}\n\n"
-        # Add button for each link (up to 3 per result)
+
+        # Add a button for each link (up to 3 per result)
         for j, link in enumerate(r['all_links'][:3], 1):
             kb_buttons.append([InlineKeyboardButton(text=f"⬇️ {i}.{j}", url=link)])
+
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
     return text, kb
+
+
+# ───────────── AIOGRAM HANDLERS ─────────────
 
 @router.message(CommandStart())
 async def start(message: types.Message):
@@ -130,6 +220,7 @@ async def start(message: types.Message):
         parse_mode="HTML"
     )
 
+
 @router.message(Command("addchannel"))
 async def add_channel(message: types.Message):
     args = message.text.split()
@@ -142,6 +233,7 @@ async def add_channel(message: types.Message):
         await message.answer(f"✅ Added @{channel}")
     else:
         await message.answer(f"@{channel} already in list.")
+
 
 @router.message(Command("removechannel"))
 async def remove_channel(message: types.Message):
@@ -156,19 +248,22 @@ async def remove_channel(message: types.Message):
     else:
         await message.answer(f"@{channel} not in list.")
 
+
 @router.message(Command("channels"))
 async def list_channels(message: types.Message):
     if not channel_list:
-        await message.answer("No channels added. Use /addchannel to add one.")
+        await message.answer("No channels added. Use /addchannel @username.")
         return
     text = "📋 <b>Channels:</b>\n\n" + "\n".join([f"@{c}" for c in channel_list])
     await message.answer(text, parse_mode="HTML")
+
 
 @router.message(F.text, lambda m: m.chat.type == "private")
 async def search(message: types.Message):
     query = message.text.strip()
     if not query:
         return
+
     if not channel_list:
         await message.answer(
             "❌ No channels configured.\n\n"
@@ -176,17 +271,27 @@ async def search(message: types.Message):
             parse_mode="HTML"
         )
         return
+
     await message.bot.send_chat_action(message.chat.id, "typing")
     await message.answer(f"🔍 Searching channels for <b>{query}</b>...", parse_mode="HTML")
+
     results = await global_channel_search(query)
     text, kb = format_results(results, query)
+
     if not text:
-        await message.answer(f"❌ No results found for <b>{query}</b> in configured channels.", parse_mode="HTML")
+        await message.answer(
+            f"❌ No results found for <b>{query}</b> in configured channels.",
+            parse_mode="HTML"
+        )
     else:
         await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
+
+# ───────────── HEALTH SERVER ─────────────
+
 async def health_check(request):
     return web.Response(text="OK", status=200)
+
 
 async def start_web_server():
     app = web.Application()
@@ -198,12 +303,16 @@ async def start_web_server():
     await site.start()
     logger.info(f"Health server on port {PORT}")
 
+
+# ───────────── MAIN ─────────────
+
 async def main():
     await start_web_server()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Flixora polling started")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
