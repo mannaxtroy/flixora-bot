@@ -28,10 +28,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 
-# Default channels — @ipapkornS2botdatabase already included
+# Default channel
 DEFAULT_CHANNELS = ["ipapkornS2botdatabase"]
 
-# In-memory channel list (initialized with default)
+# In-memory channel list
 channel_list = list(DEFAULT_CHANNELS)
 
 HEADERS = {
@@ -40,56 +40,26 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-
 def clean_text(t):
     return re.sub(r'\s+', ' ', t or '').strip()
 
-
 def extract_post_full_text(post):
-    """
-    Extract searchable text from a Telegram web preview post.
-    Includes message text, caption, document title, and media title.
-    """
     parts = []
-
-    # Message text
     text_elem = post.select_one("div.tgme_widget_message_text")
     if text_elem:
         parts.append(clean_text(text_elem.get_text()))
-
-    # Caption
     caption_elem = post.select_one("div.tgme_widget_message_caption")
     if caption_elem:
         parts.append(clean_text(caption_elem.get_text()))
-
-    # Document title (file name)
     doc_title = post.select_one("div.tgme_widget_message_document_title")
     if doc_title:
         parts.append(clean_text(doc_title.get_text()))
-
-    # Media title (for audio/video)
     media_title = post.select_one("div.tgme_widget_message_media_title")
     if media_title:
         parts.append(clean_text(media_title.get_text()))
-
-    # Fallback
-    if not parts:
-        for sel in [
-            "a.tgme_widget_message_document_title",
-            "span.tgme_widget_message_media_title",
-            "div.tgme_widget_message_document_extra"
-        ]:
-            elem = post.select_one(sel)
-            if elem:
-                parts.append(clean_text(elem.get_text()))
-
     return " ".join(parts)
 
-
 async def resolve_download_url(download_href: str) -> str:
-    """
-    Follow a Telegram download link and return the final CDN file URL.
-    """
     try:
         async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
             r = await client.get(download_href)
@@ -98,16 +68,10 @@ async def resolve_download_url(download_href: str) -> str:
         logger.warning(f"Failed to resolve download URL {download_href}: {e}")
         return download_href
 
-
 async def extract_post_links(post) -> list:
-    """
-    Extract direct download links from a Telegram post element.
-    Resolves document download links to final CDN URLs.
-    """
     links = []
     download_links = []
 
-    # 1. Collect all ordinary links
     for a in post.select("a"):
         href = a.get("href", "")
         if not href:
@@ -117,7 +81,6 @@ async def extract_post_links(post) -> list:
         if href not in links:
             links.append(href)
 
-    # 2. Collect document download links separately
     for a in post.select("a.tgme_widget_message_download"):
         href = a.get("href", "")
         if not href:
@@ -127,36 +90,25 @@ async def extract_post_links(post) -> list:
         if href not in download_links:
             download_links.append(href)
 
-    # 3. Resolve download links to final CDN URLs
     direct_links = []
     for href in download_links:
         resolved = await resolve_download_url(href)
         if resolved and resolved not in direct_links:
             direct_links.append(resolved)
 
-    # 4. Prefer direct CDN URLs. If none, fallback to ordinary links.
     if direct_links:
         return direct_links
-
-    # 5. If no ordinary links either, try resolving the first document download link
     if download_links:
         return download_links
-
     return links
 
-
 async def search_channel(channel: str, query: str) -> list:
-    """
-    Scrape t.me/s/<channel> for posts matching query.
-    First tries Telegram's own search (?q=), then paginates recent posts.
-    """
     results = []
     try:
         username = channel.lstrip('@')
         base = f"https://t.me/s/{username}"
 
         async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
-            # ── 1) Try Telegram built-in search ──
             search_url = f"{base}?q={query.replace(' ', '+')}"
             resp = await client.get(search_url)
             if resp.status_code == 200:
@@ -179,7 +131,6 @@ async def search_channel(channel: str, query: str) -> list:
                     if results:
                         return results
 
-            # ── 2) Fallback: paginate recent posts up to 10 pages ──
             next_url = base
             for _ in range(10):
                 resp = await client.get(next_url)
@@ -189,7 +140,6 @@ async def search_channel(channel: str, query: str) -> list:
                 posts = soup.select("div.tgme_widget_message")
                 if not posts:
                     break
-
                 found = False
                 for post in posts:
                     full_text = extract_post_full_text(post).lower()
@@ -205,10 +155,8 @@ async def search_channel(channel: str, query: str) -> list:
                             "channel": channel,
                         })
                         found = True
-
                 if found:
                     break
-
                 older = soup.select_one("a.tme_messages_more")
                 if not older:
                     break
@@ -221,14 +169,11 @@ async def search_channel(channel: str, query: str) -> list:
                     break
 
             return results
-
     except Exception as e:
         logger.warning(f"Error searching channel {channel}: {e}")
         return results
 
-
 async def global_channel_search(query: str, limit: int = 20) -> list:
-    """Search all configured channels, merge results."""
     all_results = []
     for channel in channel_list:
         res = await search_channel(channel, query)
@@ -237,27 +182,18 @@ async def global_channel_search(query: str, limit: int = 20) -> list:
             break
     return all_results[:limit]
 
-
 def format_results(results, query):
-    """Format results for Telegram with direct download buttons."""
     if not results:
         return None, None
-
     text = f"🎬 <b>Search Results for:</b> <code>{query}</code>\n\n"
     kb_buttons = []
-
     for i, r in enumerate(results[:10], 1):
         title = clean_text(r['title'])[:80]
         text += f"{i}. <b>{title}</b>\n   📁 {r['channel']}\n\n"
-
         for j, link in enumerate(r['all_links'][:3], 1):
             kb_buttons.append([InlineKeyboardButton(text=f"⬇️ {i}.{j}", url=link)])
-
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons) if kb_buttons else None
     return text, kb
-
-
-# ───────────── AIOGRAM HANDLERS ─────────────
 
 @router.message(CommandStart())
 async def start(message: types.Message):
@@ -274,16 +210,11 @@ async def start(message: types.Message):
         parse_mode="HTML"
     )
 
-
 @router.message(Command("addchannel"))
 async def add_channel(message: types.Message):
     args = message.text.split()
     if len(args) < 2:
-        await message.answer(
-            "Usage: /addchannel @username\n"
-            "Or forward a message from a public channel to auto-add.",
-            parse_mode="HTML"
-        )
+        await message.answer("Usage: /addchannel @username\nOr forward a message from a public channel to auto-add.", parse_mode="HTML")
         return
     channel = args[1].lstrip('@')
     if channel not in channel_list:
@@ -291,7 +222,6 @@ async def add_channel(message: types.Message):
         await message.answer(f"✅ Added @{channel}")
     else:
         await message.answer(f"@{channel} already in list.")
-
 
 @router.message(lambda m: m.forward_from_chat is not None)
 async def forwarded_channel_add(message: types.Message):
@@ -308,7 +238,6 @@ async def forwarded_channel_add(message: types.Message):
     else:
         await message.answer("❌ That chat doesn't have a public username, so I can't scrape it.")
 
-
 @router.message(Command("removechannel"))
 async def remove_channel(message: types.Message):
     args = message.text.split()
@@ -322,12 +251,10 @@ async def remove_channel(message: types.Message):
     else:
         await message.answer(f"@{channel} not in list.")
 
-
 @router.message(Command("clear"))
 async def clear_channels(message: types.Message):
     channel_list.clear()
     await message.answer("✅ Cleared all channels.")
-
 
 @router.message(Command("channels"))
 async def list_channels(message: types.Message):
@@ -337,41 +264,25 @@ async def list_channels(message: types.Message):
     text = "📋 <b>Channels:</b>\n\n" + "\n".join([f"@{c}" for c in channel_list])
     await message.answer(text, parse_mode="HTML")
 
-
 @router.message(F.text, lambda m: m.chat.type == "private")
 async def search(message: types.Message):
     query = message.text.strip()
     if not query:
         return
-
     if not channel_list:
-        await message.answer(
-            "❌ No channels configured.\n\n"
-            "Use /addchannel @username or forward a message from a public channel.",
-            parse_mode="HTML"
-        )
+        await message.answer("❌ No channels configured.\n\nUse /addchannel @username or forward a message from a public channel.", parse_mode="HTML")
         return
-
     await message.bot.send_chat_action(message.chat.id, "typing")
     await message.answer(f"🔍 Searching channels for <b>{query}</b>...", parse_mode="HTML")
-
     results = await global_channel_search(query)
     text, kb = format_results(results, query)
-
     if not text:
-        await message.answer(
-            f"❌ No results found for <b>{query}</b> in configured channels.",
-            parse_mode="HTML"
-        )
+        await message.answer(f"❌ No results found for <b>{query}</b> in configured channels.", parse_mode="HTML")
     else:
         await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
 
-
-# ───────────── HEALTH SERVER ─────────────
-
 async def health_check(request):
     return web.Response(text="OK", status=200)
-
 
 async def start_web_server():
     app = web.Application()
@@ -383,16 +294,12 @@ async def start_web_server():
     await site.start()
     logger.info(f"Health server on port {PORT}")
 
-
-# ───────────── MAIN ─────────────
-
 async def main():
     await start_web_server()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Flixora polling started")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
